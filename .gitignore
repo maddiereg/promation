@@ -1,0 +1,6 @@
+/build/
+/third_party/odin-imgui/*.a
+/third_party/odin-imgui/*.lib
+imgui.ini
+*.o
+*.so

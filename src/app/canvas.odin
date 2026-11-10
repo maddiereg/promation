@@ -1,7 +1,8 @@
 package main
 
-// Freehand stroke input. A stroke in progress lives here and enters the
-// document, as one undoable step, when the pen is lifted.
+// Freehand stroke input (Draw tool). A stroke in progress lives here and
+// enters the document, as one undoable step, when the pen is lifted. The dense
+// input is then fitted with a few smooth Bézier knots.
 
 import "core:math"
 import "core:math/linalg"
@@ -28,18 +29,20 @@ Stroke_Builder :: struct {
 	pressure_seen: bool,
 }
 
+// Freehand options. Colour and maximum width come from the style.
 Brush :: struct {
-	color:     pm.Color,
-	size:      f32, // maximum width in document units
-	pressure:  bool,
-	smoothing: f32, // 0 = raw input, 0.9 = very smooth
+	pressure:   bool,
+	smoothing:  f32, // 0 = raw input, 0.9 = very smooth
+	fit_curves: bool,
+	fit_px:     f32, // allowed fitting error, in screen pixels
 }
 
 // Width from pressure, with a small floor so light strokes stay visible.
-brush_width :: proc(b: Brush, pressure: f32) -> f32 {
-	if !b.pressure do return b.size
+brush_width :: proc(app: ^App, pressure: f32) -> f32 {
+	size := app.style.width
+	if !app.brush.pressure do return size
 	p := clamp(pressure, 0, 1)
-	return b.size * (0.08 + 0.92 * math.pow(p, 1.4))
+	return size * (0.08 + 0.92 * math.pow(p, 1.4))
 }
 
 // The layer new strokes go to, or the nil handle if drawing isn't possible now.
@@ -63,7 +66,7 @@ effectively_visible :: proc(app: ^App, h: pm.Layer_Handle) -> bool {
 
 @(private = "file")
 stroke_width :: proc(app: ^App, pressure: f32) -> f32 {
-	return brush_width(app.brush, app.builder.pressure_seen ? pressure : 1)
+	return brush_width(app, app.builder.pressure_seen ? pressure : 1)
 }
 
 @(private = "file")
@@ -84,7 +87,7 @@ stroke_begin :: proc(app: ^App, screen: Vec2, pressure: f32, from_pen: bool) -> 
 	b.active = true
 	b.from_pen = from_pen
 	b.layer = target
-	b.color = app.brush.color
+	b.color = app.style.stroke
 	b.smoothed = pm.screen_to_world(app.cam, screen)
 	b.last_kept = screen
 	b.pressure_seen = !from_pen // a mouse has no pressure to wait for
@@ -110,9 +113,15 @@ stroke_end :: proc(app: ^App) {
 	b := &app.builder
 	if !b.active do return
 	b.active = false
-	path := pm.Path{knots = b.knots, has_stroke = true, stroke = b.color}
+	knots := b.knots
 	b.knots = nil
-	pm.add_path(&app.history, &app.doc, b.layer, path)
+	if app.brush.fit_curves && len(knots) > 2 {
+		tolerance := app.brush.fit_px / max(app.cam.zoom * b.scale, 1e-6)
+		fitted := pm.fit_curve(knots[:], tolerance)
+		delete(knots)
+		knots = fitted
+	}
+	pm.add_path(&app.history, &app.doc, b.layer, pm.Path{knots = knots, has_stroke = true, stroke = b.color})
 }
 
 stroke_cancel :: proc(app: ^App) {

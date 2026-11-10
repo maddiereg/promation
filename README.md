@@ -6,8 +6,10 @@ tablet version sharing the same core later.
 
 Written in [Odin](https://odin-lang.org). Licensed under the GPL-3.0-or-later (see `LICENSE`).
 
-> Status: **Phase 1**, foundations. There is a document with layers, undo and
-> project files, but no animation yet. See [docs/PLAN.md](docs/PLAN.md).
+> Status: **Phase 2**, vector drawing. Shapes can be drawn (freehand, Bézier
+> pen, rectangle, ellipse), selected, transformed and edited point by point,
+> with undo and project files. No animation yet. See [docs/PLAN.md](docs/PLAN.md)
+> and [docs/phase2.md](docs/phase2.md).
 
 ## Requirements
 

@@ -18,20 +18,9 @@ Sample :: struct {
 	width: f32,
 }
 
-// Number of line segments needed to approximate a cubic within `tolerance`.
-// Uses the bound  err <= max|B''| / (8 n^2)  with  max|B''| <= 6 max(|d1|, |d2|).
-cubic_segment_count :: proc(p0, p1, p2, p3: Vec2, tolerance: f32) -> int {
-	d1 := linalg.length(p0 - 2*p1 + p2)
-	d2 := linalg.length(p1 - 2*p2 + p3)
-	dd := max(d1, d2)
-	n  := math.sqrt(0.75 * dd / max(tolerance, 1e-6))
-	return clamp(int(math.ceil(n)), 1, 512)
-}
-
-cubic_point :: proc(p0, p1, p2, p3: Vec2, t: f32) -> Vec2 {
-	u := 1 - t
-	return u*u*u*p0 + 3*u*u*t*p1 + 3*u*t*t*p2 + t*t*t*p3
-}
+cubic_segment_count :: pm.cubic_segment_count
+cubic_point         :: pm.cubic_point
+ellipse_knots       :: pm.ellipse_knots
 
 // Flattens a knot list into samples. `out` is appended to, not cleared.
 // For closed paths the last segment returns to the first knot and the
@@ -156,16 +145,4 @@ bounds_of :: proc(points: []Vec2) -> Rect {
 		r.max = linalg.max(r.max, p)
 	}
 	return r
-}
-
-// Knots for a smooth closed circle-ish blob (4 knots, kappa handles).
-ellipse_knots :: proc(center, radius: Vec2, width: f32) -> [4]Knot {
-	K :: 0.5522847498
-	k := radius * K
-	return {
-		{center + {radius.x, 0}, center + {radius.x, -k.y}, center + {radius.x, k.y}, width},
-		{center + {0, radius.y}, center + {k.x, radius.y}, center + {-k.x, radius.y}, width},
-		{center + {-radius.x, 0}, center + {-radius.x, k.y}, center + {-radius.x, -k.y}, width},
-		{center + {0, -radius.y}, center + {-k.x, -radius.y}, center + {k.x, -radius.y}, width},
-	}
 }

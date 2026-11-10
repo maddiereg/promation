@@ -14,7 +14,9 @@ import pm "../core"
 draw_ui :: proc(app: ^App) {
 	draw_menu_bar(app)
 	im.DockSpaceOverViewport(0, nil, {.PassthruCentralNode})
+	draw_overlays(app)
 	draw_tools_panel(app)
+	draw_style_panel(app)
 	draw_layers_panel(app)
 	draw_properties_panel(app)
 	draw_document_panel(app)
@@ -40,25 +42,100 @@ draw_menu_bar :: proc(app: ^App) {
 	if im.BeginMenu("Edit") {
 		if im.MenuItem("Undo", "Ctrl+Z", false, pm.can_undo(&app.history)) do pm.undo(&app.history, &app.doc)
 		if im.MenuItem("Redo", "Ctrl+Y", false, pm.can_redo(&app.history)) do pm.redo(&app.history, &app.doc)
+		im.Separator()
+		if im.MenuItem("Select all", "Ctrl+A") do select_all(app)
+		if im.MenuItem("Delete", "Del") do delete_selection(app)
+		im.EndMenu()
+	}
+	if im.BeginMenu("Shape") {
+		has := len(target_paths(app)) > 0
+		if im.MenuItem("Raise", "PgUp", false, has) do restack_selection(app, .Raise)
+		if im.MenuItem("Lower", "PgDn", false, has) do restack_selection(app, .Lower)
+		if im.MenuItem("Bring to front", "Shift+PgUp", false, has) do restack_selection(app, .To_Front)
+		if im.MenuItem("Send to back", "Shift+PgDn", false, has) do restack_selection(app, .To_Back)
+		im.Separator()
+		if im.MenuItem("Toggle corner / smooth", "C", false, app.tool == .Points && len(app.selection.points) > 0) do toggle_selected_corners(app)
 		im.EndMenu()
 	}
 }
 
 @(private = "file")
+TOOL_HINTS := [Tool]cstring{
+	.Select    = "Click a shape to select, Shift+click to add, drag to move or box-select. Drag the box to scale (Shift: keep proportions, Alt: from centre) or the top circle to rotate (Shift: 15 deg steps).",
+	.Points    = "Click or box-select points, drag to move. Drag a handle to bend (Alt: break the curve). Double-click a curve to add a point, a point to switch corner/smooth (C). Del removes points.",
+	.Draw      = "Freehand strokes. The tablet's eraser end deletes shapes in every tool.",
+	.Pen       = "Click: corner point. Click and drag: curve point. Click the first point to close, Enter or double-click the last to finish open. Backspace removes the last point, Esc cancels.",
+	.Rectangle = "Drag to draw. Shift: square. Alt: from the centre.",
+	.Ellipse   = "Drag to draw. Shift: circle. Alt: from the centre.",
+	.Pan       = "Drag to pan. Also: middle drag or Space+drag in any tool.",
+}
+
+@(private = "file")
 draw_tools_panel :: proc(app: ^App) {
 	im.SetNextWindowPos({20, 50}, .FirstUseEver)
+	im.SetNextWindowSize({300, 0}, .FirstUseEver)
 	defer im.End()
 	if !im.Begin("Tools") do return
-	if im.RadioButton("Draw (B)", app.tool == .Draw) do app.tool = .Draw
+	for t in Tool {
+		if im.RadioButton(TOOL_LABELS[t], app.tool == t) do set_tool(app, t)
+		if t != .Pan && int(t) % 2 == 0 do im.SameLine(150)
+	}
+	im.Separator()
+	im.PushTextWrapPos(0)
+	im.TextDisabled("%s", TOOL_HINTS[app.tool])
+	im.PopTextWrapPos()
+	if app.tool == .Draw {
+		im.SeparatorText("Brush")
+		im.Checkbox("Pressure", &app.brush.pressure)
+		im.SliderFloat("Smoothing", &app.brush.smoothing, 0, 0.9, "%.2f")
+		im.Checkbox("Fit curves", &app.brush.fit_curves)
+		if app.brush.fit_curves do im.SliderFloat("Fit error px", &app.brush.fit_px, 0.25, 8, "%.2f")
+	}
+	if app.tool != .Pan && drawable_layer(app) == {} {
+		im.TextWrapped("Select a visible, unlocked vector layer to edit.")
+	}
+}
+
+// Style for new shapes. With shapes (or points) selected, it shows the first
+// one's style and edits apply to all of them, one undo step per drag.
+@(private = "file")
+draw_style_panel :: proc(app: ^App) {
+	im.SetNextWindowPos({20, 400}, .FirstUseEver)
+	defer im.End()
+	if !im.Begin("Style") do return
+
+	targets := target_paths(app)
+	if len(targets) > 0 {
+		im.TextDisabled("Editing %d selected shape%s", i32(len(targets)), len(targets) == 1 ? cstring("") : cstring("s"))
+	} else {
+		im.TextDisabled("Style for new shapes")
+	}
+	edit :: proc(app: ^App, changed: bool, field: Style_Field, has_targets: bool) {
+		if changed && has_targets do apply_style(app, field, merge_key = 1 << 40 | u64(field))
+		if im.IsItemDeactivatedAfterEdit() do pm.history_seal(&app.history)
+	}
+	has := len(targets) > 0
+	edit(app, im.Checkbox("##fill_on", &app.style.fill_on), .Fill, has)
 	im.SameLine()
-	if im.RadioButton("Pan (H)", app.tool == .Pan) do app.tool = .Pan
-	im.SeparatorText("Brush")
-	im.ColorEdit4("Colour", &app.brush.color)
-	im.SliderFloat("Size", &app.brush.size, 0.5, 200, "%.1f", {.Logarithmic})
-	im.Checkbox("Pressure", &app.brush.pressure)
-	im.SliderFloat("Smoothing", &app.brush.smoothing, 0, 0.9, "%.2f")
-	if drawable_layer(app) == {} {
-		im.TextWrapped("Select a visible, unlocked vector layer to draw.")
+	edit(app, im.ColorEdit4("Fill", &app.style.fill, {.AlphaBar}), .Fill, has)
+	edit(app, im.Checkbox("##stroke_on", &app.style.stroke_on), .Stroke, has)
+	im.SameLine()
+	edit(app, im.ColorEdit4("Stroke", &app.style.stroke, {.AlphaBar}), .Stroke, has)
+	width_label: cstring = app.tool == .Points && has ? "Point width" : "Width"
+	edit(app, im.SliderFloat(width_label, &app.style.width, 0.25, 200, "%.2f", {.Logarithmic}), .Width, has)
+
+	if has {
+		closed := pm.path(&app.doc, targets[0]).closed
+		if im.Checkbox("Closed", &closed) do apply_style(app, .Closed, closed)
+		im.SameLine()
+		if im.Button("Delete") do delete_selection(app)
+		if im.Button("Front") do restack_selection(app, .To_Front)
+		im.SameLine()
+		if im.Button("Raise") do restack_selection(app, .Raise)
+		im.SameLine()
+		if im.Button("Lower") do restack_selection(app, .Lower)
+		im.SameLine()
+		if im.Button("Back") do restack_selection(app, .To_Back)
 	}
 }
 
@@ -241,6 +318,11 @@ draw_view_panel :: proc(app: ^App) {
 	rot := app.cam.rotation
 	if im.SliderAngle("Rotation", &rot, -180, 180) do pm.camera_rotate_at(&app.cam, center, rot)
 	if im.Button("Fit page (Home)") do fit_view(app)
+	im.SeparatorText("Grid")
+	im.Checkbox("Show (G)", &app.grid.show)
+	im.SameLine()
+	im.Checkbox("Snap (Shift+G)", &app.grid.snap)
+	im.SliderFloat("Spacing", &app.grid.size, 1, 500, "%.0f", {.Logarithmic})
 	im.TextDisabled("Wheel: zoom   Ctrl+wheel: rotate")
 	im.TextDisabled("Middle drag / Space+drag: pan")
 }

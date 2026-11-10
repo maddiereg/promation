@@ -64,7 +64,7 @@ project_io_handle_event :: proc(app: ^App, e: ^sdl.Event) -> bool {
 
 // New documents start with one layer to draw on, already counted as "clean".
 reset_document :: proc(app: ^App) {
-	stroke_cancel(app)
+	tools_reset(app)
 	pm.history_destroy(&app.history)
 	pm.document_destroy(&app.doc)
 	pm.document_init(&app.doc)
@@ -111,7 +111,7 @@ action_open :: proc(app: ^App) {
 }
 
 action_save_as :: proc(app: ^App) {
-	stroke_cancel(app)
+	tools_reset(app)
 	sdl.ShowSaveFileDialog(dialog_callback, rawptr(uintptr(Dialog_Kind.Save)), app.window, &dialog_filters[0], len(dialog_filters), nil)
 }
 
@@ -153,7 +153,7 @@ open_path :: proc(app: ^App, path: string) {
 		return
 	}
 
-	stroke_cancel(app)
+	tools_reset(app)
 	pm.history_destroy(&app.history)
 	pm.document_destroy(&app.doc)
 	app.doc = loaded

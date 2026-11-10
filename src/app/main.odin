@@ -1,7 +1,7 @@
 package main
 
-// Promation, Phase 0: SDL3 + SDL_GPU + Dear ImGui (docking) + vector renderer
-// + pen input. Goal: validate the stack before building the real editor.
+// Promation desktop front end: SDL3 + SDL_GPU + Dear ImGui (docking) on top
+// of the shared core (../core) and the vector renderer (../render).
 
 import "core:log"
 import "core:math"
@@ -14,11 +14,6 @@ import im_gpu "third:odin-imgui/backends/sdlgpu3"
 
 import pm "../core"
 import "../render"
-
-Tool :: enum {
-	Draw,
-	Pan,
-}
 
 Pen_State :: struct {
 	seen:        bool, // any pen event received this session
@@ -54,13 +49,20 @@ App :: struct {
 
 	cam:        pm.Camera,
 	tool:       Tool,
+	style:      Style,
 	brush:      Brush,
+	grid:       Grid,
 	builder:    Stroke_Builder,
+	pen_path:   Pen_Path,
+	selection:  Selection,
+	drag:       Drag,
+	pointer:    Pointer,
 	pen:        Pen_State,
 
 	panning:    bool,
 	space_held: bool,
 	last_mouse: Vec2, // px
+	hover_px:   Vec2, // last pointer position over the canvas
 
 	show_imgui_demo:  bool,
 	clear_color:      render.Color,
@@ -128,7 +130,9 @@ app_init :: proc(app: ^App) -> bool {
 	im_gpu.Init(&init_info)
 
 	app.tool = .Draw
-	app.brush = {color = {0.1, 0.12, 0.2, 1}, size = 8, pressure = true, smoothing = 0.35}
+	app.style = {fill_on = true, fill = {0.96, 0.62, 0.27, 1}, stroke_on = true, stroke = {0.1, 0.12, 0.2, 1}, width = 6}
+	app.brush = {pressure = true, smoothing = 0.35, fit_curves = true, fit_px = 1}
+	app.grid = {size = 40}
 	app.clear_color = {0.16, 0.16, 0.18, 1}
 	app.running = true
 	update_window_metrics(app)
@@ -145,6 +149,7 @@ app_shutdown :: proc(app: ^App) {
 	im_gpu.Shutdown()
 	im.DestroyContext()
 	delete(app.builder.knots)
+	tools_destroy(app)
 	delete(app.file_path)
 	pm.history_destroy(&app.history)
 	pm.document_destroy(&app.doc)
@@ -172,7 +177,7 @@ note_stroke_pressure :: proc(app: ^App, pressure: f32) {
 	if !b.pressure_seen {
 		// Points so far used the full-width fallback; give them real pressure.
 		b.pressure_seen = true
-		for &k in b.knots do k.width = brush_width(app.brush, pressure) / b.scale
+		for &k in b.knots do k.width = brush_width(app, pressure) / b.scale
 	}
 	app.pen.stroke_pressure_events += 1
 	app.pen.stroke_pressure_min = min(app.pen.stroke_pressure_min, pressure)
@@ -213,9 +218,8 @@ app_events :: proc(app: ^App) {
 			case .XTILT:    app.pen.tilt.x = e.paxis.value
 			case .YTILT:    app.pen.tilt.y = e.paxis.value
 			}
-			if app.builder.active && app.builder.from_pen {
-				stroke_add(app, Vec2{e.paxis.x, e.paxis.y} * app.density, app.pen.pressure)
-			}
+			pen_pointer := app.pointer.down && app.pointer.from_pen
+			if pen_pointer do pointer_move(app, Vec2{e.paxis.x, e.paxis.y} * app.density, app.pen.pressure)
 		case .PEN_DOWN, .PEN_UP:
 			app.pen.seen = true
 			app.pen.events += 1
@@ -223,55 +227,60 @@ app_events :: proc(app: ^App) {
 			app.pen.eraser = e.ptouch.eraser
 			p := Vec2{e.ptouch.x, e.ptouch.y} * app.density
 			if e.ptouch.down {
-				if !io.WantCaptureMouse && app.tool == .Draw && !app.space_held && stroke_begin(app, p, app.pen.pressure, true) {
-					app.pen.stroke_pressure_events = 0
-					app.pen.stroke_pressure_min = 1
-					app.pen.stroke_pressure_max = 0
-					app.pen.stroke_start_pressure = app.pen.pressure
-					app.pen.stroke_which = e.ptouch.which
-					app.pen.stroke_motion_events = 0
-					app.pen.stroke_axis_events = {}
-				} else {
-					log.infof("pen down ignored: ui_capture=%v tool=%v space=%v drawable=%v", io.WantCaptureMouse, app.tool, app.space_held, drawable_layer(app) != {})
+				if io.WantCaptureMouse || app.pointer.down do break
+				app.pen.stroke_pressure_events = 0
+				app.pen.stroke_pressure_min = 1
+				app.pen.stroke_pressure_max = 0
+				app.pen.stroke_start_pressure = app.pen.pressure
+				app.pen.stroke_which = e.ptouch.which
+				app.pen.stroke_motion_events = 0
+				app.pen.stroke_axis_events = {}
+				pointer_down(app, p, app.pen.pressure, true, e.ptouch.eraser)
+			} else if app.pointer.down && app.pointer.from_pen {
+				if app.builder.active {
+					log.infof("pen stroke: pen=%v points=%d motion=%d pressure_events=%d min=%.3f max=%.3f pressure_at_down=%.3f axes=%v stray_pressure=%d",
+						app.pen.stroke_which, len(app.builder.knots), app.pen.stroke_motion_events,
+						app.pen.stroke_pressure_events, app.pen.stroke_pressure_min, app.pen.stroke_pressure_max,
+						app.pen.stroke_start_pressure, app.pen.stroke_axis_events, app.pen.stray_pressure_events)
 				}
-			} else if app.builder.active && app.builder.from_pen {
-				log.infof("pen stroke: pen=%v eraser=%v points=%d motion=%d pressure_events=%d min=%.3f max=%.3f pressure_at_down=%.3f axes=%v stray_pressure=%d",
-					app.pen.stroke_which, app.pen.eraser,
-					len(app.builder.knots), app.pen.stroke_motion_events,
-					app.pen.stroke_pressure_events, app.pen.stroke_pressure_min, app.pen.stroke_pressure_max,
-					app.pen.stroke_start_pressure, app.pen.stroke_axis_events, app.pen.stray_pressure_events)
 				app.pen.stray_pressure_events = 0
-				stroke_end(app)
+				pointer_up(app, p)
 			}
 		case .PEN_MOTION:
 			app.pen.events += 1
-			if app.builder.active && app.builder.from_pen {
+			p := Vec2{e.pmotion.x, e.pmotion.y} * app.density
+			if app.pointer.down && app.pointer.from_pen {
 				app.pen.stroke_motion_events += 1
-				stroke_add(app, Vec2{e.pmotion.x, e.pmotion.y} * app.density, app.pen.pressure)
+				pointer_move(app, p, app.pen.pressure)
+			} else if !app.pointer.down {
+				app.hover_px = p
 			}
 
 		// Mouse. Pen-synthesised mouse events (which == PEN_MOUSEID) only feed
-		// ImGui; the canvas handles the pen through the events above.
+		// ImGui and panning; the canvas handles the pen through the events above.
 		case .MOUSE_BUTTON_DOWN:
-			if e.button.which == sdl.PEN_MOUSEID || io.WantCaptureMouse do break
+			if e.button.which == sdl.PEN_MOUSEID || io.WantCaptureMouse || app.pointer.down do break
 			p := Vec2{e.button.x, e.button.y} * app.density
 			app.last_mouse = p
-			if e.button.button == sdl.BUTTON_MIDDLE || (e.button.button == sdl.BUTTON_LEFT && (app.tool == .Pan || app.space_held)) {
+			if e.button.button == sdl.BUTTON_MIDDLE {
 				app.panning = true
-			} else if e.button.button == sdl.BUTTON_LEFT && app.tool == .Draw {
-				if stroke_begin(app, p, 1, false) do log.infof("non-pen stroke (constant width): source=%s", e.button.which == sdl.TOUCH_MOUSEID ? "touch" : "mouse")
+			} else if e.button.button == sdl.BUTTON_LEFT {
+				pointer_down(app, p, 1, false, false)
 			}
 		case .MOUSE_BUTTON_UP:
 			if e.button.which == sdl.PEN_MOUSEID do break
-			app.panning = false
-			if app.builder.active && !app.builder.from_pen do stroke_end(app)
+			p := Vec2{e.button.x, e.button.y} * app.density
+			if e.button.button == sdl.BUTTON_MIDDLE do app.panning = false
+			if e.button.button == sdl.BUTTON_LEFT && app.pointer.down && !app.pointer.from_pen do pointer_up(app, p)
 		case .MOUSE_MOTION:
 			p := Vec2{e.motion.x, e.motion.y} * app.density
+			if app.panning do app.cam.pan += p - app.last_mouse // the pen pans through these too
 			if e.motion.which != sdl.PEN_MOUSEID {
-				if app.panning do app.cam.pan += p - app.last_mouse
-				if app.builder.active && !app.builder.from_pen do stroke_add(app, p, 1)
-			} else if app.panning {
-				app.cam.pan += p - app.last_mouse // pen + space pans too
+				if app.pointer.down && !app.pointer.from_pen {
+					pointer_move(app, p, 1)
+				} else if !app.pointer.down {
+					app.hover_px = p
+				}
 			}
 			app.last_mouse = p
 		case .MOUSE_WHEEL:
@@ -291,7 +300,8 @@ app_events :: proc(app: ^App) {
 			ctrl := .LCTRL in e.key.mod || .RCTRL in e.key.mod
 			shift := .LSHIFT in e.key.mod || .RSHIFT in e.key.mod
 			switch {
-			case app.builder.active:           // no document changes mid-stroke
+			case tool_busy(app):               // no document changes mid-gesture
+			case tool_key(app, e.key.key, ctrl, shift):
 			case ctrl && shift && e.key.key == sdl.K_Z: pm.redo(&app.history, &app.doc)
 			case ctrl && e.key.key == sdl.K_Z: pm.undo(&app.history, &app.doc)
 			case ctrl && e.key.key == sdl.K_Y: pm.redo(&app.history, &app.doc)
@@ -300,8 +310,6 @@ app_events :: proc(app: ^App) {
 			case ctrl && e.key.key == sdl.K_O: action_open(app)
 			case ctrl && e.key.key == sdl.K_N: action_new(app)
 			case e.key.key == sdl.K_HOME:      fit_view(app)
-			case e.key.key == sdl.K_B:         app.tool = .Draw
-			case e.key.key == sdl.K_H:         app.tool = .Pan
 			}
 		case .KEY_UP:
 			if e.key.key == sdl.K_SPACE {
@@ -317,6 +325,7 @@ app_events :: proc(app: ^App) {
 app_frame :: proc(app: ^App) {
 	defer free_all(context.temp_allocator)
 	ensure_active_layer(app)
+	selection_prune(app)
 	update_window_title(app)
 
 	im_gpu.NewFrame()
@@ -370,11 +379,7 @@ draw_document :: proc(app: ^App) {
 	render.fill_knots(r, page[:], s.background, tolerance)
 
 	// The stroke being drawn is shown inside its layer, not on top of everything.
-	preview: pm.Preview
-	if b := &app.builder; b.active {
-		preview = {b.layer, {knots = b.knots, has_stroke = true, stroke = b.color}}
-	}
-	for &p in pm.evaluate(&app.doc, preview) {
+	for &p in pm.evaluate(&app.doc, tool_preview(app)) {
 		if p.has_fill do render.fill_knots(r, p.knots, p.fill, tolerance)
 		if p.has_stroke do render.stroke_knots(r, p.knots, p.closed, p.stroke, tolerance)
 	}

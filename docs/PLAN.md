@@ -44,7 +44,7 @@ We take inspiration from the feature set only: name, branding, icons and UI are 
 |---|---|---|
 | 0. Tests | SDL3 + SDL_GPU + ImGui; anti-aliased vector rendering; pen pressure; Android core build | 2–4 wk |
 | 1. Foundations | math, document model, handles, undo, save/load, viewport, headless tests | 1–1.5 mo |
-| 2. Vector drawing | point/curve model, drawing & editing tools (in progress: docs/phase2.md) | 1.5–2 mo |
+| 2. Vector drawing | point/curve model, drawing & editing tools (done: docs/phase2.md) | 1.5–2 mo |
 | 3. Animation | channels, timeline UI, playback, onion skin | 1–1.5 mo |
 | 4. Bones | bone layer, FK, point & weighted binding | 1–1.5 mo |
 | 5. v0.1 MVP | PNG/MP4 export, autosave, polish | ~1 mo |

@@ -81,6 +81,9 @@ main :: proc() {
 }
 
 app_init :: proc(app: ^App) -> bool {
+	// Closing the window should send only WINDOW_CLOSE_REQUESTED, not a QUIT
+	// as well; otherwise the unsaved-changes prompt appears twice.
+	_ = sdl.SetHint(sdl.HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0")
 	if !sdl.Init({.VIDEO}) {
 		log.errorf("SDL_Init: %s", sdl.GetError())
 		return false

@@ -6,8 +6,8 @@ tablet version sharing the same core later.
 
 Written in [Odin](https://odin-lang.org). Licensed under the GPL-3.0-or-later (see `LICENSE`).
 
-> Status: **Phase 0**, a technology test. Nothing here is usable for animation yet.
-> See [docs/PLAN.md](docs/PLAN.md) and [docs/phase0.md](docs/phase0.md).
+> Status: **Phase 1**, foundations. There is a document with layers, undo and
+> project files, but no animation yet. See [docs/PLAN.md](docs/PLAN.md).
 
 ## Requirements
 
@@ -38,7 +38,8 @@ Other modes:
 ## Layout
 
 ```
-src/app/          application: window, input, ImGui panels (package main)
+src/core/         document model, undo, evaluation, project files (no UI or GPU)
+src/app/          desktop application: window, input, ImGui panels (package main)
 src/render/       GPU vector renderer + curve/stroke geometry
 src/tools/        developer tools (headless render test)
 shaders/          GLSL sources, compiled to SPIR-V into build/shaders/

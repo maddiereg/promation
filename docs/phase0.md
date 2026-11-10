@@ -35,15 +35,17 @@ Stencil-then-cover with MSAA (`src/render/renderer.odin`):
 
 ## Known issues / follow-ups
 
-- **Eraser end delivers no pressure to the app (Wayland, SDL 3.4.18).** `WAYLAND_DEBUG` shows the
-  compositor sending pressure for every eraser stroke, but the app receives no `PEN_AXIS` event of
-  any kind for them, while `PEN_DOWN`/`PEN_MOTION` arrive normally. Reading SDL's Wayland pen code
-  did not reveal why. With no pressure the stroke is drawn at the 8% minimum width.
-- **Unexplained tip failures.** One session lost pressure on 14 of 31 strokes from the tip's Wayland
-  tool, then recovered without the pen leaving range. A later controlled run had none. `pen stroke`
-  log lines remain in debug builds so a recurrence can be diagnosed.
-- Each flattened stroke point adds a full disc: 607k vertices and 22 fps on a debug build with
-  269 strokes. Reduce in Phase 1.
+- **SDL sometimes drops pen pressure (Wayland, SDL 3.4.18, Wacom CTH-680).** For stretches of
+  strokes, on the tip or the eraser, no `PEN_AXIS` event is created at all, while `PEN_DOWN` and
+  `PEN_MOTION` arrive normally. `WAYLAND_DEBUG` shows the compositor sending pressure during those
+  strokes, and `SDL_EVENT_LOGGING=2` shows SDL creating no axis events for them. The app receives
+  every axis event SDL does create, so the fault is in SDL's Wayland tablet handling. Reading its
+  source did not reveal the cause. Workaround: a pen stroke draws at full brush width until its
+  first pressure reading arrives, instead of at the minimum width. To do: report upstream with a
+  standalone repro. `pen stroke` log lines remain in debug builds.
+- Fixed in Phase 1: each flattened stroke point added a full disc (607k vertices and 22 fps on a
+  debug build with 269 strokes). Gentle joins now use two triangles; the test scene went from
+  14,697 to 4,110 vertices.
 - `vendor:sdl3` declares `GetPenDeviceType` with no return value, so it can't be
   called; the pen panel doesn't show the device type for now. Worth reporting upstream to Odin.
 - Shaders are SPIR-V only (Linux/Windows Vulkan). macOS needs MSL: add SDL_shadercross

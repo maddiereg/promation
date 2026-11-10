@@ -1,69 +1,36 @@
 package main
 
-// Phase 0 canvas: camera (pan/zoom/rotate) and freehand strokes with pen
-// pressure. This is a test harness, not the final document model.
+// Freehand stroke input. A stroke in progress lives here and enters the
+// document, as one undoable step, when the pen is lifted.
 
 import "core:math"
 import "core:math/linalg"
 
-import "../render"
+import pm "../core"
 
-Vec2 :: render.Vec2
-
-Camera :: struct {
-	pan:      Vec2, // screen-pixel position of the world origin
-	zoom:     f32,
-	rotation: f32, // radians
-}
-
-world_to_screen :: proc(c: Camera, p: Vec2) -> Vec2 {
-	cs, sn := math.cos(c.rotation), math.sin(c.rotation)
-	return c.pan + c.zoom * Vec2{cs * p.x - sn * p.y, sn * p.x + cs * p.y}
-}
-
-screen_to_world :: proc(c: Camera, s: Vec2) -> Vec2 {
-	d := (s - c.pan) / c.zoom
-	cs, sn := math.cos(-c.rotation), math.sin(-c.rotation)
-	return {cs * d.x - sn * d.y, sn * d.x + cs * d.y}
-}
-
-// Zooms by `factor`, keeping the world point under `anchor` (screen px) fixed.
-camera_zoom_at :: proc(c: ^Camera, anchor: Vec2, factor: f32) {
-	world := screen_to_world(c^, anchor)
-	c.zoom = clamp(c.zoom * factor, 0.02, 64)
-	c.pan += anchor - world_to_screen(c^, world)
-}
-
-// Rotates about `anchor` (screen px).
-camera_rotate_at :: proc(c: ^Camera, anchor: Vec2, new_rotation: f32) {
-	world := screen_to_world(c^, anchor)
-	c.rotation = new_rotation
-	c.pan += anchor - world_to_screen(c^, world)
-}
-
-// Frames the 960x540 page in a viewport of `size` pixels.
-camera_fit_page :: proc(c: ^Camera, size: Vec2) {
-	PAGE :: Vec2{960, 540}
-	c.rotation = 0
-	c.zoom = min(size.x / PAGE.x, size.y / PAGE.y) * 0.85
-	c.pan = (size - PAGE * c.zoom) * 0.5
-}
-
-Stroke :: struct {
-	samples: [dynamic]render.Sample, // world space
-	color:   render.Color,
-}
+Vec2 :: pm.Vec2
 
 Stroke_Builder :: struct {
 	active:    bool,
 	from_pen:  bool,
-	smoothed:  Vec2, // world space, exponentially smoothed input
-	last_kept: Vec2, // screen space of the last stored sample
+	layer:     pm.Layer_Handle,
+	knots:     [dynamic]pm.Knot, // layer space
+	color:     pm.Color,
+	to_layer:  pm.Mat3, // document -> layer
+	to_doc:    pm.Mat3, // layer -> document
+	scale:     f32, // layer -> document width scale
+	smoothed:  Vec2, // document space, exponentially smoothed input
+	last_kept: Vec2, // screen space of the last stored point
+
+	// SDL on Wayland sometimes delivers no pressure at all for a pen stroke
+	// (docs/phase0.md). Until a reading arrives, the stroke uses full width
+	// rather than the near-zero minimum.
+	pressure_seen: bool,
 }
 
 Brush :: struct {
-	color:     render.Color,
-	size:      f32, // max width in world units
+	color:     pm.Color,
+	size:      f32, // maximum width in document units
 	pressure:  bool,
 	smoothing: f32, // 0 = raw input, 0.9 = very smooth
 }
@@ -75,38 +42,80 @@ brush_width :: proc(b: Brush, pressure: f32) -> f32 {
 	return b.size * (0.08 + 0.92 * math.pow(p, 1.4))
 }
 
-stroke_begin :: proc(app: ^App, screen: Vec2, pressure: f32, from_pen: bool) {
-	w := screen_to_world(app.cam, screen)
-	append(&app.strokes, Stroke{color = app.brush.color})
-	s := &app.strokes[len(app.strokes) - 1]
-	append(&s.samples, render.Sample{w, brush_width(app.brush, pressure)})
-	app.builder = {active = true, from_pen = from_pen, smoothed = w, last_kept = screen}
+// The layer new strokes go to, or the nil handle if drawing isn't possible now.
+drawable_layer :: proc(app: ^App) -> pm.Layer_Handle {
+	l := pm.layer(&app.doc, app.active_layer)
+	if l == nil || l.kind != .Vector || l.locked do return {}
+	if !effectively_visible(app, app.active_layer) do return {}
+	if _, ok := pm.mat3_invert(pm.layer_world_matrix(&app.doc, app.active_layer)); !ok do return {}
+	return app.active_layer
+}
+
+effectively_visible :: proc(app: ^App, h: pm.Layer_Handle) -> bool {
+	current := h
+	for current != {} {
+		l := pm.layer(&app.doc, current)
+		if l == nil || !l.visible do return false
+		current = l.parent
+	}
+	return true
+}
+
+@(private = "file")
+stroke_width :: proc(app: ^App, pressure: f32) -> f32 {
+	return brush_width(app.brush, app.builder.pressure_seen ? pressure : 1)
+}
+
+@(private = "file")
+append_point :: proc(b: ^Stroke_Builder, doc_pos: Vec2, width: f32) {
+	p := pm.mat3_apply(b.to_layer, doc_pos)
+	append(&b.knots, pm.Knot{p, p, p, width / b.scale})
+}
+
+// Returns false if there is no layer that can be drawn on.
+stroke_begin :: proc(app: ^App, screen: Vec2, pressure: f32, from_pen: bool) -> bool {
+	target := drawable_layer(app)
+	if target == {} do return false
+
+	b := &app.builder
+	b.to_doc = pm.layer_world_matrix(&app.doc, target)
+	b.to_layer, _ = pm.mat3_invert(b.to_doc)
+	b.scale = pm.mat3_scale(b.to_doc)
+	b.active = true
+	b.from_pen = from_pen
+	b.layer = target
+	b.color = app.brush.color
+	b.smoothed = pm.screen_to_world(app.cam, screen)
+	b.last_kept = screen
+	b.pressure_seen = !from_pen // a mouse has no pressure to wait for
+	clear(&b.knots)
+	append_point(b, b.smoothed, stroke_width(app, pressure))
+	return true
 }
 
 stroke_add :: proc(app: ^App, screen: Vec2, pressure: f32) {
 	b := &app.builder
 	if !b.active do return
 	MIN_SPACING_PX :: 1.5
-	target := screen_to_world(app.cam, screen)
+	target := pm.screen_to_world(app.cam, screen)
 	b.smoothed = linalg.lerp(target, b.smoothed, app.brush.smoothing)
-	if linalg.length(world_to_screen(app.cam, b.smoothed) - b.last_kept) < MIN_SPACING_PX do return
-	s := &app.strokes[len(app.strokes) - 1]
-	append(&s.samples, render.Sample{b.smoothed, brush_width(app.brush, pressure)})
-	b.last_kept = world_to_screen(app.cam, b.smoothed)
+	kept := pm.world_to_screen(app.cam, b.smoothed)
+	if linalg.length(kept - b.last_kept) < MIN_SPACING_PX do return
+	append_point(b, b.smoothed, stroke_width(app, pressure))
+	b.last_kept = kept
 }
 
+// Moves the finished stroke into the document.
 stroke_end :: proc(app: ^App) {
-	app.builder.active = false
+	b := &app.builder
+	if !b.active do return
+	b.active = false
+	path := pm.Path{knots = b.knots, has_stroke = true, stroke = b.color}
+	b.knots = nil
+	pm.add_path(&app.history, &app.doc, b.layer, path)
 }
 
-strokes_undo :: proc(app: ^App) {
-	if app.builder.active || len(app.strokes) == 0 do return
-	s := pop(&app.strokes)
-	delete(s.samples)
-}
-
-strokes_clear :: proc(app: ^App) {
-	for s in app.strokes do delete(s.samples)
-	clear(&app.strokes)
+stroke_cancel :: proc(app: ^App) {
 	app.builder.active = false
+	clear(&app.builder.knots)
 }

@@ -6,16 +6,11 @@ package render
 import "core:math"
 import "core:math/linalg"
 
-Vec2  :: [2]f32
-Color :: [4]f32 // straight RGBA, 0..1
+import pm "../core"
 
-// A cubic Bézier knot: position, handles (absolute positions) and stroke width.
-Knot :: struct {
-	pos:        Vec2,
-	handle_in:  Vec2,
-	handle_out: Vec2,
-	width:      f32,
-}
+Vec2  :: pm.Vec2
+Color :: pm.Color
+Knot  :: pm.Knot
 
 // Sample on a flattened path: position plus interpolated stroke width.
 Sample :: struct {
@@ -48,7 +43,8 @@ flatten_knots :: proc(knots: []Knot, closed: bool, tolerance: f32, out: ^[dynami
 	for i in 0 ..< seg_count {
 		a := knots[i]
 		b := knots[(i + 1) % len(knots)]
-		n := cubic_segment_count(a.pos, a.handle_out, b.handle_in, b.pos, tolerance)
+		straight := a.handle_out == a.pos && b.handle_in == b.pos
+		n := straight ? 1 : cubic_segment_count(a.pos, a.handle_out, b.handle_in, b.pos, tolerance)
 		last := n
 		if closed && i == seg_count - 1 do last = n - 1
 		for s in 1 ..= last {
@@ -73,15 +69,16 @@ fan_triangles :: proc(contour: []Sample, out: ^[dynamic]Vec2) {
 }
 
 // Expands a polyline with per-sample width into triangles: one quad per
-// segment plus a disc at every sample (round joins and caps). Overlaps are
-// harmless because strokes are resolved through the stencil buffer.
-// `tolerance` is the maximum chord error for the discs, in world units.
+// segment, a join at each interior sample, round caps on open ends. Overlaps
+// are harmless because strokes are resolved through the stencil buffer.
+// `tolerance` is the maximum geometric error, in world units.
 stroke_triangles :: proc(samples: []Sample, closed: bool, tolerance: f32, out: ^[dynamic]Vec2) {
 	n := len(samples)
 	if n == 0 do return
 
-	for s in samples do disc_triangles(s.pos, s.width * 0.5, tolerance, out)
-
+	first_normal, previous_normal: Vec2
+	first_valid := -1
+	last_valid := -1
 	seg_count := closed ? n : n - 1
 	for i in 0 ..< seg_count {
 		a := samples[i]
@@ -95,7 +92,41 @@ stroke_triangles :: proc(samples: []Sample, closed: bool, tolerance: f32, out: ^
 		b0 := b.pos + nrm * b.width * 0.5
 		b1 := b.pos - nrm * b.width * 0.5
 		append(out, a0, b0, b1, a0, b1, a1)
+
+		if first_valid < 0 {
+			first_valid = i
+			first_normal = nrm
+		} else {
+			join_triangles(a.pos, a.width * 0.5, previous_normal, nrm, tolerance, out)
+		}
+		previous_normal = nrm
+		last_valid = i
 	}
+
+	if first_valid < 0 {
+		// All points coincide: a tap draws a dot.
+		disc_triangles(samples[0].pos, samples[0].width * 0.5, tolerance, out)
+	} else if closed {
+		s := samples[first_valid]
+		join_triangles(s.pos, s.width * 0.5, previous_normal, first_normal, tolerance, out)
+	} else {
+		start := samples[first_valid]
+		end := samples[(last_valid + 1) % n]
+		disc_triangles(start.pos, start.width * 0.5, tolerance, out)
+		disc_triangles(end.pos, end.width * 0.5, tolerance, out)
+	}
+}
+
+// Fills the wedge between two segments. Gentle turns get two triangles,
+// sharp ones a full disc, chosen so the error stays within `tolerance`.
+join_triangles :: proc(c: Vec2, r: f32, n0, n1: Vec2, tolerance: f32, out: ^[dynamic]Vec2) {
+	cos_turn := clamp(linalg.dot(n0, n1), -1, 1)
+	cos_half := math.sqrt((1 + cos_turn) * 0.5)
+	if r * (1 - cos_half) > tolerance {
+		disc_triangles(c, r, tolerance, out)
+		return
+	}
+	append(out, c, c + n0 * r, c + n1 * r, c, c - n0 * r, c - n1 * r)
 }
 
 disc_triangles :: proc(c: Vec2, r: f32, tolerance: f32, out: ^[dynamic]Vec2) {

@@ -3,7 +3,6 @@ package main
 // Promation, Phase 0: SDL3 + SDL_GPU + Dear ImGui (docking) + vector renderer
 // + pen input. Goal: validate the stack before building the real editor.
 
-import "core:fmt"
 import "core:log"
 import "core:math"
 import "core:os"
@@ -13,6 +12,7 @@ import im "third:odin-imgui"
 import im_sdl "third:odin-imgui/backends/sdl3"
 import im_gpu "third:odin-imgui/backends/sdlgpu3"
 
+import pm "../core"
 import "../render"
 
 Tool :: enum {
@@ -47,10 +47,14 @@ App :: struct {
 	density:    f32, // pixels per window point
 	size_px:    Vec2,
 
-	cam:        Camera,
+	doc:          pm.Document,
+	history:      pm.History,
+	active_layer: pm.Layer_Handle,
+	file_path:    string, // empty until first saved
+
+	cam:        pm.Camera,
 	tool:       Tool,
 	brush:      Brush,
-	strokes:    [dynamic]Stroke,
 	builder:    Stroke_Builder,
 	pen:        Pen_State,
 
@@ -58,7 +62,6 @@ App :: struct {
 	space_held: bool,
 	last_mouse: Vec2, // px
 
-	show_demo_scene:  bool,
 	show_imgui_demo:  bool,
 	clear_color:      render.Color,
 	running:          bool,
@@ -123,11 +126,11 @@ app_init :: proc(app: ^App) -> bool {
 
 	app.tool = .Draw
 	app.brush = {color = {0.1, 0.12, 0.2, 1}, size = 8, pressure = true, smoothing = 0.35}
-	app.show_demo_scene = true
 	app.clear_color = {0.16, 0.16, 0.18, 1}
 	app.running = true
 	update_window_metrics(app)
-	camera_fit_page(&app.cam, app.size_px)
+	project_io_init()
+	reset_document(app)
 
 	log.infof("gpu driver: %s, video driver: %s", sdl.GetGPUDeviceDriver(app.device), sdl.GetCurrentVideoDriver())
 	return true
@@ -138,8 +141,10 @@ app_shutdown :: proc(app: ^App) {
 	im_sdl.Shutdown()
 	im_gpu.Shutdown()
 	im.DestroyContext()
-	strokes_clear(app)
-	delete(app.strokes)
+	delete(app.builder.knots)
+	delete(app.file_path)
+	pm.history_destroy(&app.history)
+	pm.document_destroy(&app.doc)
 	render.destroy(&app.renderer)
 	sdl.ReleaseWindowFromGPUDevice(app.device, app.window)
 	sdl.DestroyGPUDevice(app.device)
@@ -157,12 +162,14 @@ update_window_metrics :: proc(app: ^App) {
 
 // --- Input --------------------------------------------------------------------
 
-// Records a pressure reading for the active pen stroke. PEN_DOWN can arrive
-// before the first pressure event, so the first point's width is corrected here.
+// Records a pressure reading for the active pen stroke. PEN_DOWN arrives before
+// the first pressure event, so points drawn before it are corrected here.
 note_stroke_pressure :: proc(app: ^App, pressure: f32) {
-	if app.pen.stroke_pressure_events == 0 {
-		s := &app.strokes[len(app.strokes) - 1]
-		s.samples[0].width = brush_width(app.brush, pressure)
+	b := &app.builder
+	if !b.pressure_seen {
+		// Points so far used the full-width fallback; give them real pressure.
+		b.pressure_seen = true
+		for &k in b.knots do k.width = brush_width(app.brush, pressure) / b.scale
 	}
 	app.pen.stroke_pressure_events += 1
 	app.pen.stroke_pressure_min = min(app.pen.stroke_pressure_min, pressure)
@@ -173,11 +180,12 @@ app_events :: proc(app: ^App) {
 	io := im.GetIO()
 	e: sdl.Event
 	for sdl.PollEvent(&e) {
+		if project_io_handle_event(app, &e) do continue
 		im_sdl.ProcessEvent(&e)
 
 		#partial switch e.type {
 		case .QUIT, .WINDOW_CLOSE_REQUESTED:
-			app.running = false
+			request_quit(app)
 
 		case .WINDOW_PIXEL_SIZE_CHANGED, .WINDOW_RESIZED, .WINDOW_DISPLAY_SCALE_CHANGED:
 			update_window_metrics(app)
@@ -212,8 +220,7 @@ app_events :: proc(app: ^App) {
 			app.pen.eraser = e.ptouch.eraser
 			p := Vec2{e.ptouch.x, e.ptouch.y} * app.density
 			if e.ptouch.down {
-				if !io.WantCaptureMouse && app.tool == .Draw && !app.space_held {
-					stroke_begin(app, p, app.pen.pressure, true)
+				if !io.WantCaptureMouse && app.tool == .Draw && !app.space_held && stroke_begin(app, p, app.pen.pressure, true) {
 					app.pen.stroke_pressure_events = 0
 					app.pen.stroke_pressure_min = 1
 					app.pen.stroke_pressure_max = 0
@@ -222,16 +229,16 @@ app_events :: proc(app: ^App) {
 					app.pen.stroke_motion_events = 0
 					app.pen.stroke_axis_events = {}
 				} else {
-					log.infof("pen down ignored: ui_capture=%v tool=%v space=%v", io.WantCaptureMouse, app.tool, app.space_held)
+					log.infof("pen down ignored: ui_capture=%v tool=%v space=%v drawable=%v", io.WantCaptureMouse, app.tool, app.space_held, drawable_layer(app) != {})
 				}
 			} else if app.builder.active && app.builder.from_pen {
-				stroke_end(app)
 				log.infof("pen stroke: pen=%v eraser=%v points=%d motion=%d pressure_events=%d min=%.3f max=%.3f pressure_at_down=%.3f axes=%v stray_pressure=%d",
 					app.pen.stroke_which, app.pen.eraser,
-					len(app.strokes[len(app.strokes) - 1].samples), app.pen.stroke_motion_events,
+					len(app.builder.knots), app.pen.stroke_motion_events,
 					app.pen.stroke_pressure_events, app.pen.stroke_pressure_min, app.pen.stroke_pressure_max,
 					app.pen.stroke_start_pressure, app.pen.stroke_axis_events, app.pen.stray_pressure_events)
 				app.pen.stray_pressure_events = 0
+				stroke_end(app)
 			}
 		case .PEN_MOTION:
 			app.pen.events += 1
@@ -249,8 +256,7 @@ app_events :: proc(app: ^App) {
 			if e.button.button == sdl.BUTTON_MIDDLE || (e.button.button == sdl.BUTTON_LEFT && (app.tool == .Pan || app.space_held)) {
 				app.panning = true
 			} else if e.button.button == sdl.BUTTON_LEFT && app.tool == .Draw {
-				stroke_begin(app, p, 1, false)
-				log.infof("non-pen stroke (constant width): source=%s", e.button.which == sdl.TOUCH_MOUSEID ? "touch" : "mouse")
+				if stroke_begin(app, p, 1, false) do log.infof("non-pen stroke (constant width): source=%s", e.button.which == sdl.TOUCH_MOUSEID ? "touch" : "mouse")
 			}
 		case .MOUSE_BUTTON_UP:
 			if e.button.which == sdl.PEN_MOUSEID do break
@@ -269,18 +275,28 @@ app_events :: proc(app: ^App) {
 			if io.WantCaptureMouse do break
 			anchor := Vec2{e.wheel.mouse_x, e.wheel.mouse_y} * app.density
 			if .LCTRL in sdl.GetModState() || .RCTRL in sdl.GetModState() {
-				camera_rotate_at(&app.cam, anchor, app.cam.rotation + e.wheel.y * math.to_radians(f32(5)))
+				pm.camera_rotate_at(&app.cam, anchor, app.cam.rotation + e.wheel.y * math.to_radians(f32(5)))
 			} else {
-				camera_zoom_at(&app.cam, anchor, math.pow(1.15, e.wheel.y))
+				pm.camera_zoom_at(&app.cam, anchor, math.pow(1.15, e.wheel.y))
 			}
 
 		case .KEY_DOWN:
 			if e.key.key == sdl.K_SPACE do app.space_held = true
-			if io.WantCaptureKeyboard do break
+			// A focused panel doesn't block shortcuts; typing in a text field does
+			// (it has its own Ctrl+Z).
+			if io.WantTextInput do break
 			ctrl := .LCTRL in e.key.mod || .RCTRL in e.key.mod
+			shift := .LSHIFT in e.key.mod || .RSHIFT in e.key.mod
 			switch {
-			case ctrl && e.key.key == sdl.K_Z: strokes_undo(app)
-			case e.key.key == sdl.K_HOME:      camera_fit_page(&app.cam, app.size_px)
+			case app.builder.active:           // no document changes mid-stroke
+			case ctrl && shift && e.key.key == sdl.K_Z: pm.redo(&app.history, &app.doc)
+			case ctrl && e.key.key == sdl.K_Z: pm.undo(&app.history, &app.doc)
+			case ctrl && e.key.key == sdl.K_Y: pm.redo(&app.history, &app.doc)
+			case ctrl && shift && e.key.key == sdl.K_S: action_save_as(app)
+			case ctrl && e.key.key == sdl.K_S: action_save(app)
+			case ctrl && e.key.key == sdl.K_O: action_open(app)
+			case ctrl && e.key.key == sdl.K_N: action_new(app)
+			case e.key.key == sdl.K_HOME:      fit_view(app)
 			case e.key.key == sdl.K_B:         app.tool = .Draw
 			case e.key.key == sdl.K_H:         app.tool = .Pan
 			}
@@ -296,6 +312,10 @@ app_events :: proc(app: ^App) {
 // --- Frame --------------------------------------------------------------------
 
 app_frame :: proc(app: ^App) {
+	defer free_all(context.temp_allocator)
+	ensure_active_layer(app)
+	update_window_title(app)
+
 	im_gpu.NewFrame()
 	im_sdl.NewFrame()
 	im.NewFrame()
@@ -303,14 +323,7 @@ app_frame :: proc(app: ^App) {
 	im.Render()
 	draw_data := im.GetDrawData()
 
-	// Scene
-	r := &app.renderer
-	tolerance := 0.25 / app.cam.zoom // quarter-pixel flattening error
-	render.begin_frame(r, render.view_matrix(app.size_px, app.cam.pan, app.cam.zoom, app.cam.rotation))
-	if app.show_demo_scene do render.demo_scene(r, tolerance)
-	for &s in app.strokes {
-		render.stroke_samples(r, s.samples[:], false, s.color, tolerance)
-	}
+	draw_document(app)
 
 	cmd := sdl.AcquireGPUCommandBuffer(app.device)
 	swap: ^sdl.GPUTexture
@@ -321,6 +334,7 @@ app_frame :: proc(app: ^App) {
 		return
 	}
 
+	r := &app.renderer
 	render.upload(r, cmd)
 	im_gpu.PrepareDrawData(draw_data, cmd)
 
@@ -336,70 +350,39 @@ app_frame :: proc(app: ^App) {
 	_ = sdl.SubmitGPUCommandBuffer(cmd)
 }
 
-draw_ui :: proc(app: ^App) {
-	im.DockSpaceOverViewport(0, nil, {.PassthruCentralNode})
-	io := im.GetIO()
+// Builds this frame's vector draw list from the evaluated document.
+draw_document :: proc(app: ^App) {
+	r := &app.renderer
+	tolerance := 0.25 / app.cam.zoom // quarter-pixel flattening error
+	render.begin_frame(r, render.view_matrix(app.size_px, app.cam.pan, app.cam.zoom, app.cam.rotation))
 
-	im.SetNextWindowPos({20, 40}, .FirstUseEver)
-	if im.Begin("Tools") {
-		if im.RadioButton("Draw (B)", app.tool == .Draw) do app.tool = .Draw
-		im.SameLine()
-		if im.RadioButton("Pan (H)", app.tool == .Pan) do app.tool = .Pan
-		im.SeparatorText("Brush")
-		im.ColorEdit4("Colour", &app.brush.color)
-		im.SliderFloat("Size", &app.brush.size, 0.5, 64, "%.1f")
-		im.Checkbox("Pressure", &app.brush.pressure)
-		im.SliderFloat("Smoothing", &app.brush.smoothing, 0, 0.9, "%.2f")
-		im.SeparatorText("Strokes")
-		im.Text("%d strokes", i32(len(app.strokes)))
-		if im.Button("Undo (Ctrl+Z)") do strokes_undo(app)
-		im.SameLine()
-		if im.Button("Clear") do strokes_clear(app)
-		im.Checkbox("Show test scene", &app.show_demo_scene)
+	s := app.doc.settings
+	w, h := f32(s.width), f32(s.height)
+	page := [4]pm.Knot{
+		{{0, 0}, {0, 0}, {0, 0}, 0},
+		{{w, 0}, {w, 0}, {w, 0}, 0},
+		{{w, h}, {w, h}, {w, h}, 0},
+		{{0, h}, {0, h}, {0, h}, 0},
 	}
-	im.End()
+	render.fill_knots(r, page[:], s.background, tolerance)
 
-	im.SetNextWindowPos({20, 420}, .FirstUseEver)
-	if im.Begin("View") {
-		zoom := app.cam.zoom * 100
-		center := app.size_px * 0.5
-		if im.SliderFloat("Zoom %", &zoom, 2, 6400, "%.0f", {.Logarithmic}) {
-			camera_zoom_at(&app.cam, center, zoom / 100 / app.cam.zoom)
-		}
-		rot := app.cam.rotation
-		if im.SliderAngle("Rotation", &rot, -180, 180) do camera_rotate_at(&app.cam, center, rot)
-		if im.Button("Fit page (Home)") do camera_fit_page(&app.cam, app.size_px)
-		im.TextDisabled("Wheel: zoom   Ctrl+wheel: rotate")
-		im.TextDisabled("Middle drag / Space+drag: pan")
+	// The stroke being drawn is shown inside its layer, not on top of everything.
+	preview: pm.Preview
+	if b := &app.builder; b.active {
+		preview = {b.layer, {knots = b.knots, has_stroke = true, stroke = b.color}}
 	}
-	im.End()
-
-	im.SetNextWindowPos({20, 600}, .FirstUseEver)
-	if im.Begin("Pen") {
-		p := app.pen
-		if !p.seen {
-			im.TextWrapped("No pen events yet. Bring a stylus near the tablet.")
-		} else {
-			im.Text("In range: %s   Down: %s   Eraser: %s",
-				p.in_range ? cstring("yes") : "no", p.down ? cstring("yes") : "no", p.eraser ? cstring("yes") : "no")
-			im.ProgressBar(p.pressure, {-1, 0}, fmt.ctprintf("pressure %.3f", p.pressure))
-			im.Text("Tilt: %.1f, %.1f", p.tilt.x, p.tilt.y)
-			im.Text("Events: %d", i32(p.events))
-		}
+	for &p in pm.evaluate(&app.doc, preview) {
+		if p.has_fill do render.fill_knots(r, p.knots, p.fill, tolerance)
+		if p.has_stroke do render.stroke_knots(r, p.knots, p.closed, p.stroke, tolerance)
 	}
-	im.End()
+}
 
-	im.SetNextWindowPos({1250, 40}, .FirstUseEver)
-	if im.Begin("Renderer") {
-		st := app.renderer.stats
-		im.Text("Driver: %s", sdl.GetGPUDeviceDriver(app.device))
-		im.Text("MSAA: %s   Stencil: %s", fmt.ctprint(app.renderer.samples), fmt.ctprint(app.renderer.ds_format))
-		im.Text("%.1f fps (%.2f ms)", io.Framerate, 1000 / max(io.Framerate, 0.001))
-		im.Text("Shapes: %d   Vertices: %d   Draws: %d", i32(st.shapes), i32(st.vertices), i32(st.draw_calls))
-		im.Text("Viewport: %.0fx%.0f px @ %.2fx", app.size_px.x, app.size_px.y, app.density)
-		im.Checkbox("ImGui demo window", &app.show_imgui_demo)
-	}
-	im.End()
+// Keeps a valid selection after undo, delete or load.
+ensure_active_layer :: proc(app: ^App) {
+	if pm.layer_is_linked(&app.doc, app.active_layer) do return
+	app.active_layer = len(app.doc.root) > 0 ? app.doc.root[len(app.doc.root) - 1] : {}
+}
 
-	if app.show_imgui_demo do im.ShowDemoWindow(&app.show_imgui_demo)
+request_quit :: proc(app: ^App) {
+	if confirm_discard(app) do app.running = false
 }
